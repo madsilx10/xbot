@@ -1,0 +1,231 @@
+import asyncio
+import os
+import random
+import re
+
+# MONKEY PATCH: fix twikit 2.3.3 KEY_BYTE indices bug (X changed ondemand.s.js structure)
+# Remove this block when twikit releases a fix
+_tx_mod = __import__('twikit.x_client_transaction.transaction', fromlist=['ClientTransaction'])
+_tx_mod.ON_DEMAND_FILE_REGEX = re.compile(
+    r""",(\d+):["']ondemand\.s["']""", flags=(re.VERBOSE | re.MULTILINE))
+_tx_mod.ON_DEMAND_HASH_PATTERN = r',{}:"([0-9a-f]+")'
+_tx_mod.INDICES_REGEX = re.compile(
+    r"""(\(\w{1,2}\[(\d{1,2})\],\s*16\))+""", flags=(re.VERBOSE | re.MULTILINE))
+
+async def _patched_get_indices(self, home_page_response, session, headers):
+    key_byte_indices = []
+    response = self.validate_response(home_page_response) or self.home_page_response
+    response_str = str(response)
+    on_demand_file = _tx_mod.ON_DEMAND_FILE_REGEX.search(response_str)
+    if on_demand_file:
+        on_demand_file_index = on_demand_file.group(1)
+        hash_regex = re.compile(_tx_mod.ON_DEMAND_HASH_PATTERN.format(on_demand_file_index))
+        hash_match = hash_regex.search(response_str)
+        if hash_match:
+            filename = hash_match.group(1)
+            on_demand_file_url = f"https://abs.twimg.com/responsive-web/client-web/ondemand.s.{filename}a.js"
+            on_demand_file_response = await session.request(method="GET", url=on_demand_file_url, headers=headers)
+            key_byte_indices_match = _tx_mod.INDICES_REGEX.finditer(str(on_demand_file_response.text))
+            for item in key_byte_indices_match:
+                key_byte_indices.append(item.group(2))
+    if not key_byte_indices:
+        raise Exception("Couldn't get KEY_BYTE indices")
+    key_byte_indices = list(map(int, key_byte_indices))
+    return key_byte_indices[0], key_byte_indices[1:]
+
+_tx_mod.ClientTransaction.get_indices = _patched_get_indices
+# END MONKEY PATCH
+
+from twikit import Client
+
+# ── File paths ──────────────────────────────────────────────
+ACCOUNTS_FILE = "accounts.txt"
+TWEETS_FILE   = "tweets.txt"
+POSTED_FILE   = "posted.txt"
+IMAGES_DIR    = "images"
+
+# ── Helpers ─────────────────────────────────────────────────
+
+def load_accounts():
+    accounts = []
+    with open(ACCOUNTS_FILE, "r") as f:
+        lines = [l.strip() for l in f.readlines()]
+    i = 0
+    while i < len(lines):
+        if lines[i] == "":
+            i += 1
+            continue
+        auth_token = lines[i]
+        ct0        = lines[i + 1] if i + 1 < len(lines) else None
+        if auth_token and ct0:
+            accounts.append({"auth_token": auth_token, "ct0": ct0})
+        i += 2
+    return accounts
+
+
+def load_threads():
+    """Separator antar akun: ---
+    Separator antar tweet dalam thread: baris kosong
+    """
+    threads = []
+    with open(TWEETS_FILE, "r") as f:
+        content = f.read()
+    blocks = content.strip().split("\n---\n")
+    for block in blocks:
+        block = block.strip()
+        if not block:
+            continue
+        tweets = [t.strip() for t in block.split("\n\n") if t.strip()]
+        if tweets:
+            threads.append(tweets)
+    return threads
+
+
+def load_posted():
+    if not os.path.exists(POSTED_FILE):
+        return {}
+    posted = {}
+    with open(POSTED_FILE, "r") as f:
+        for line in f:
+            line = line.strip()
+            if "|" in line:
+                idx, url = line.split("|", 1)
+                posted[int(idx)] = url
+    return posted
+
+
+def save_posted(acct_index, tweet_url):
+    with open(POSTED_FILE, "a") as f:
+        f.write(f"{acct_index}|{tweet_url}\n")
+
+
+def get_image_path(acct_index):
+    for ext in ["jpg", "jpeg", "png", "gif", "webp"]:
+        path = os.path.join(IMAGES_DIR, f"{acct_index}.{ext}")
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def get_media_type(image_path):
+    ext = image_path.rsplit(".", 1)[-1].lower()
+    return {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+            "gif": "image/gif", "webp": "image/webp"}.get(ext, "image/jpeg")
+
+
+# ── Core ─────────────────────────────────────────────────────
+
+async def post_thread(client, tweets, acct_index):
+    image_path     = get_image_path(acct_index)
+    first_tweet    = None
+    last_tweet     = None
+
+    for i, text in enumerate(tweets):
+        media_ids = None
+
+        # Attach image to first tweet only
+        if i == 0 and image_path:
+            print(f"  📷 Uploading image: {image_path}")
+            media_type = get_media_type(image_path)
+            media_id = await client.upload_media(
+                image_path,
+                media_type=media_type,
+                wait_for_completion=True
+            )
+            media_ids = [str(media_id)]
+
+        if i == 0:
+            # Tweet pertama — post biasa
+            tweet = await client.create_tweet(text=text, media_ids=media_ids)
+            first_tweet = tweet
+        else:
+            # Reply ke tweet sebelumnya
+            tweet = await client.create_tweet(
+                text=text,
+                reply_to=last_tweet.id,
+                media_ids=media_ids
+            )
+
+        last_tweet = tweet
+
+        print(f"  ✅ Tweet {i+1}/{len(tweets)} posted (id: {tweet.id})")
+
+        if i < len(tweets) - 1:
+            delay = random.randint(8, 15)
+            print(f"  ⏳ Waiting {delay}s...")
+            await asyncio.sleep(delay)
+
+    return first_tweet.id
+
+
+async def run():
+    accounts = load_accounts()
+    threads  = load_threads()
+    posted   = load_posted()
+
+    if len(accounts) != len(threads):
+        print(f"⚠️  Jumlah akun ({len(accounts)}) != jumlah thread ({len(threads)})")
+        print("Pastikan urutan akun & thread di file sama.")
+        return
+
+    total = len(accounts)
+    print(f"\n📋 Total akun: {total}")
+    print("Pilih mode:")
+    print("  1. 1 akun")
+    print("  2. Semua akun")
+    print("  3. Range akun")
+    mode = input("\nPilihan (1/2/3): ").strip()
+
+    if mode == "1":
+        pick = int(input(f"Nomor akun (1-{total}): ").strip())
+        indices = [pick]
+    elif mode == "2":
+        indices = list(range(1, total + 1))
+    elif mode == "3":
+        start = int(input(f"Dari akun (1-{total}): ").strip())
+        end   = int(input(f"Sampai akun (1-{total}): ").strip())
+        indices = list(range(start, end + 1))
+    else:
+        print("❌ Pilihan tidak valid.")
+        return
+
+    print(f"\n🚀 Akan post untuk akun: {indices}\n")
+
+    for idx in indices:
+        account = accounts[idx - 1]
+        thread  = threads[idx - 1]
+        print(f"\n🔑 Akun {idx}")
+
+        if idx in posted:
+            print(f"  ⏭️  Sudah pernah post → {posted[idx]} — skip.")
+            continue
+
+        client = Client(language="en-US")
+        client.set_cookies({
+            "auth_token": account["auth_token"],
+            "ct0":        account["ct0"],
+        })
+        client.http.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+            "x-csrf-token": account["ct0"],
+        })
+
+        try:
+            first_id  = await post_thread(client, thread, idx)
+            tweet_url = f"https://x.com/i/web/status/{first_id}"
+            save_posted(idx, tweet_url)
+            print(f"  🔗 Link: {tweet_url}")
+        except Exception as e:
+            import traceback
+            print(f"  ❌ Error akun {idx}:")
+            traceback.print_exc()
+
+        delay = random.randint(10, 20)
+        print(f"\n⏳ Waiting {delay}s before next account...")
+        await asyncio.sleep(delay)
+
+    print("\n🏁 Done!")
+
+
+if __name__ == "__main__":
+    asyncio.run(run())
